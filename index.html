@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Neural ANPR & Blur Plate Reconstruction Engine</title>
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/ort.min.js"></script>
-  <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady()"></script>
+  <script async src="https://docs.opencv.org/4.8.0/opencv.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <style>
     :root {
@@ -24,7 +24,10 @@
     h1 { color: var(--accent); font-size: 1.45rem; }
     .status-pill { background: #064e3b; color: #34d399; padding: 6px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; max-width: 480px; }
     .upload-zone { background: var(--card); border: 2px dashed var(--accent); border-radius: 10px; padding: 24px; text-align: center; margin-bottom: 20px; }
-    input[type="file"] { color: var(--text); font-size: 0.95rem; cursor: pointer; }
+    .file-label { display: inline-block; padding: 10px 22px; background: #1e293b; color: var(--accent); border: 1px solid var(--accent); border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.95rem; }
+    .file-label:hover { background: #0f172a; }
+    input[type="file"] { display: none; }
+    #fileName { margin-left: 10px; color: var(--muted); font-size: 0.9rem; }
     button { margin-top: 14px; padding: 12px 28px; background: var(--accent); color: #040812; font-weight: 700; border: none; border-radius: 6px; cursor: pointer; font-size: 1rem; }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
     .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
@@ -44,11 +47,13 @@
         <h1>Neural ANPR & Pixel Recovery Engine</h1>
         <p style="color:var(--muted); font-size:0.85rem;">Multi-Angle Plate Alignment + Residual Deblur CNN + Indian RTO OCR</p>
       </div>
-      <div class="status-pill" id="engineStatus">Loading Neural Deblur Engine...</div>
+      <div class="status-pill" id="engineStatus">Loading Engines...</div>
     </header>
 
     <div class="upload-zone">
-      <input type="file" id="imageUpload" accept="image/*" disabled />
+      <label for="imageUpload" class="file-label">Select Vehicle Image</label>
+      <input type="file" id="imageUpload" accept="image/*" />
+      <span id="fileName">No file chosen</span>
       <br />
       <button id="processBtn" disabled>Run Plate Detection, Pixel Deblur & OCR</button>
     </div>
@@ -81,43 +86,53 @@
     ort.env.wasm.simd = false;
 
     let enhancerSession = null;
-    let cvLoaded = false;
+    let imageReady = false;
 
     const statusEl = document.getElementById('engineStatus');
     const uploadEl = document.getElementById('imageUpload');
+    const fileNameEl = document.getElementById('fileName');
     const processBtn = document.getElementById('processBtn');
     const inputCanvas = document.getElementById('inputCanvas');
     const cropCanvas = document.getElementById('cropCanvas');
     const deblurCanvas = document.getElementById('deblurCanvas');
 
+    function isCvReady() {
+      return typeof cv !== 'undefined' && typeof cv.imread === 'function';
+    }
+
+    function updateStatus() {
+      const cvOk = isCvReady();
+      if (enhancerSession && cvOk) {
+        statusEl.textContent = "All Neural Engines Online (Ready)";
+        statusEl.style.background = "#064e3b";
+        statusEl.style.color = "#34d399";
+        if (imageReady) processBtn.disabled = false;
+      } else if (!cvOk) {
+        statusEl.textContent = "Initializing OpenCV Vision Engine...";
+      } else {
+        statusEl.textContent = "Loading Neural Deblur CNN...";
+      }
+    }
+
+    const cvCheckTimer = setInterval(() => {
+      if (isCvReady()) {
+        clearInterval(cvCheckTimer);
+        updateStatus();
+      }
+    }, 300);
+
     async function initModels() {
       try {
         const enhResp = await fetch('./pixel_enhancer.onnx');
-        if (!enhResp.ok) throw new Error("pixel_enhancer.onnx HTTP " + enhResp.status);
+        if (!enhResp.ok) throw new Error("HTTP " + enhResp.status);
         const enhBuf = await enhResp.arrayBuffer();
         enhancerSession = await ort.InferenceSession.create(enhBuf, {
           executionProviders: ['wasm']
         });
-        checkReady();
       } catch (err) {
-        statusEl.textContent = "Deblur Fallback Active (OpenCV Ready)";
         enhancerSession = "fallback";
-        checkReady();
       }
-    }
-
-    function onOpenCvReady() {
-      cvLoaded = true;
-      checkReady();
-    }
-
-    function checkReady() {
-      if (enhancerSession && cvLoaded) {
-        statusEl.textContent = "All Neural Engines Online (Ready)";
-        statusEl.style.background = "#064e3b";
-        statusEl.style.color = "#34d399";
-        uploadEl.disabled = false;
-      }
+      updateStatus();
     }
 
     initModels();
@@ -125,11 +140,13 @@
     uploadEl.addEventListener('change', (e) => {
       const file = e.target.files[0];
       if (!file) return;
+      fileNameEl.textContent = file.name;
       const img = new Image();
       img.onload = () => {
         inputCanvas.width = img.width;
         inputCanvas.height = img.height;
         inputCanvas.getContext('2d').drawImage(img, 0, 0);
+        imageReady = true;
         processBtn.disabled = false;
       };
       img.src = URL.createObjectURL(file);
@@ -186,14 +203,28 @@
         tctx.putImageData(outImg, 0, 0);
       }
 
-      deblurCanvas.width = 384;
-      deblurCanvas.height = 128;
-      const dctx = deblurCanvas.getContext('2d');
-      dctx.filter = "grayscale(100%) contrast(155%) brightness(105%)";
-      dctx.drawImage(temp, 0, 0, 384, 128);
+      // OpenCV Unsharp Mask + Local Contrast Enhancement (No Whitewash!)
+      let mat = cv.imread(temp);
+      let resized = new cv.Mat();
+      let gray = new cv.Mat();
+      let blur = new cv.Mat();
+      let sharp = new cv.Mat();
+
+      cv.resize(mat, resized, new cv.Size(384, 128), 0, 0, cv.INTER_CUBIC);
+      cv.cvtColor(resized, gray, cv.COLOR_RGBA2GRAY);
+      cv.GaussianBlur(gray, blur, new cv.Size(0, 0), 3);
+      cv.addWeighted(gray, 1.8, blur, -0.8, 0, sharp);
+      cv.normalize(sharp, sharp, 0, 255, cv.NORM_MINMAX);
+
+      cv.imshow('deblurCanvas', sharp);
+      mat.delete(); resized.delete(); gray.delete(); blur.delete(); sharp.delete();
     }
 
     processBtn.addEventListener('click', async () => {
+      if (!isCvReady()) {
+        alert("OpenCV is still loading, please wait 2 seconds and click again.");
+        return;
+      }
       processBtn.disabled = true;
       const resultCard = document.getElementById('resultCard');
       const logs = document.getElementById('pipelineLogs');
@@ -228,7 +259,6 @@
             let aspect = rect.width / rect.height;
             let area = cv.contourArea(approx);
 
-            // Indian plate aspect ratio (1.8 to 5.5) and minimum area filter
             if (aspect >= 1.8 && aspect <= 5.5 && area > imgArea * 0.005 && area < imgArea * 0.7) {
               if (area > maxScore) {
                 maxScore = area;
@@ -257,7 +287,6 @@
           srcTri.delete(); dstTri.delete(); M.delete(); bestQuad.delete();
           logs.textContent = "Step 2: Plate locked & straightened via 4-point perspective transform...";
         } else {
-          // Center-lower bumper fallback crop if angle is extreme
           let cx = Math.floor(src.cols * 0.25);
           let cy = Math.floor(src.rows * 0.45);
           let cw = Math.floor(src.cols * 0.50);
