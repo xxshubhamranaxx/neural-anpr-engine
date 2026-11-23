@@ -44,7 +44,7 @@
     <header>
       <div>
         <h1>Neural ANPR & Pixel Recovery Engine</h1>
-        <p style="color:var(--muted); font-size:0.85rem;">Rotated MinAreaRect Alignment + Residual Deblur CNN + Deconvolution</p>
+        <p style="color:var(--muted); font-size:0.85rem;">Rotated MinAreaRect Alignment + Residual Deblur CNN + Stroke Reconstruction</p>
       </div>
       <div class="status-pill" id="engineStatus">Loading Engines...</div>
     </header>
@@ -179,27 +179,30 @@
         tctx.putImageData(outImg, 0, 0);
       }
 
-      // Directional Motion Deconvolution + Adaptive Stroke Sharpening
+      // 1. High-Res Upscale + Grayscale
       let mat = cv.imread(temp);
       let resized = new cv.Mat();
       let gray = new cv.Mat();
-      let deconv = new cv.Mat();
-      let sharp = new cv.Mat();
-
-      cv.resize(mat, resized, new cv.Size(384, 128), 0, 0, cv.INTER_CUBIC);
+      cv.resize(mat, resized, new cv.Size(480, 160), 0, 0, cv.INTER_CUBIC);
       cv.cvtColor(resized, gray, cv.COLOR_RGBA2GRAY);
 
-      // 1D Horizontal Wiener-style Inverse Sharpening Kernel
-      let kernel = cv.matFromArray(1, 5, cv.CV_32F, [-0.35, -0.65, 3.0, -0.65, -0.35]);
-      cv.filter2D(gray, deconv, cv.CV_8U, kernel);
+      // 2. Horizontal Deconvolution to collapse motion blur width
+      let deconv = new cv.Mat();
+      let hKernel = cv.matFromArray(1, 7, cv.CV_32F, [-0.25, -0.5, -0.75, 4.0, -0.75, -0.5, -0.25]);
+      cv.filter2D(gray, deconv, cv.CV_8U, hKernel);
 
-      // Bilateral + High-Pass Edge Boost
-      let smooth = new cv.Mat();
-      cv.GaussianBlur(deconv, smooth, new cv.Size(0, 0), 1.5);
-      cv.addWeighted(deconv, 1.6, smooth, -0.6, 0, sharp);
+      // 3. Morphological Dilation (shrinks thick smeared black text into crisp strokes)
+      let thinned = new cv.Mat();
+      let morphKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(4, 2));
+      cv.dilate(deconv, thinned, morphKernel);
 
-      cv.imshow('deblurCanvas', sharp);
-      mat.delete(); resized.delete(); gray.delete(); deconv.delete(); sharp.delete(); kernel.delete(); smooth.delete();
+      // 4. Clean Otsu Binarization (removes grey glare/halo completely)
+      let clean = new cv.Mat();
+      cv.GaussianBlur(thinned, thinned, new cv.Size(3, 3), 0);
+      cv.threshold(thinned, clean, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+
+      cv.imshow('deblurCanvas', clean);
+      mat.delete(); resized.delete(); gray.delete(); deconv.delete(); thinned.delete(); clean.delete(); hKernel.delete(); morphKernel.delete();
     }
 
     processBtn.addEventListener('click', async () => {
@@ -216,7 +219,6 @@
         let thresh = new cv.Mat();
 
         cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
-        // Bright plate region isolation + Otsu threshold
         cv.GaussianBlur(gray, gray, new cv.Size(5, 5), 0);
         cv.threshold(gray, thresh, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
 
@@ -249,29 +251,27 @@
 
         let straightened = new cv.Mat();
         if (bestRect) {
-          // Rotate full image around plate center to make it 100% horizontal
           let M = cv.getRotationMatrix2D(bestRect.center, bestRect.angle, 1.0);
           let rotated = new cv.Mat();
           cv.warpAffine(src, rotated, M, new cv.Size(src.cols, src.rows), cv.INTER_CUBIC, cv.BORDER_REPLICATE);
 
-          let padX = bestRect.width * 0.04;
-          let padY = bestRect.height * 0.08;
-          let x = Math.max(0, Math.floor(bestRect.center.x - bestRect.width / 2 - padX));
-          let y = Math.max(0, Math.floor(bestRect.center.y - bestRect.height / 2 - padY));
-          let w = Math.min(rotated.cols - x, Math.floor(bestRect.width + 2 * padX));
-          let h = Math.min(rotated.rows - y, Math.floor(bestRect.height + 2 * padY));
+          // Crop inner plate area slightly tighter to exclude blue IND strip from OCR
+          let x = Math.max(0, Math.floor(bestRect.center.x - bestRect.width * 0.44));
+          let y = Math.max(0, Math.floor(bestRect.center.y - bestRect.height * 0.45));
+          let w = Math.min(rotated.cols - x, Math.floor(bestRect.width * 0.90));
+          let h = Math.min(rotated.rows - y, Math.floor(bestRect.height * 0.90));
 
           let cropped = rotated.roi(new cv.Rect(x, y, w, h));
-          cv.resize(cropped, straightened, new cv.Size(384, 128), 0, 0, cv.INTER_CUBIC);
+          cv.resize(cropped, straightened, new cv.Size(480, 160), 0, 0, cv.INTER_CUBIC);
           M.delete(); rotated.delete(); cropped.delete();
-          logs.textContent = `Step 2: Plate straightened (corrected ${bestRect.angle.toFixed(1)}° tilt) without cropping edges...`;
+          logs.textContent = `Step 2: Plate straightened (corrected ${bestRect.angle.toFixed(1)}° tilt)...`;
         } else {
-          cv.resize(src, straightened, new cv.Size(384, 128), 0, 0, cv.INTER_CUBIC);
+          cv.resize(src, straightened, new cv.Size(480, 160), 0, 0, cv.INTER_CUBIC);
         }
 
         cv.imshow('cropCanvas', straightened);
 
-        logs.textContent = "Step 3: Applying Residual CNN + directional motion deconvolution...";
+        logs.textContent = "Step 3: Collapsing motion blur & reconstructing crisp character strokes...";
         await runNeuralDeblur(cropCanvas);
 
         logs.textContent = "Step 4: Extracting characters & validating Indian RTO format...";
@@ -281,7 +281,8 @@
 
         const finalPlate = fixIndianRTO(text);
         document.getElementById('plateNumber').textContent = finalPlate;
-        logs.innerHTML = `Raw OCR Output: <b>${text.trim() || 'None'}</b> | OCR Confidence: <b>${confidence.toFixed(1)}%</b><br>Pipeline: MinAreaRect Angle Deskew &rarr; Residual CNN &rarr; 1D Motion Deconvolution &rarr; RTO Rule Engine`;
+        logs.innerHTML = `Raw OCR Output: <b>${text.trim() || 'None'}</b> | OCR Confidence: <b>${confidence.toFixed(1)}%</b><br>Pipeline: MinAreaRect Angle Deskew &rarr; Residual CNN &rarr; Stroke Thinning & Otsu Binarization`;
+        resultCard.scrollIntoView({ behavior: 'smooth' });
 
         src.delete(); gray.delete(); thresh.delete(); contours.delete(); hier.delete(); straightened.delete();
       } catch (e) {
