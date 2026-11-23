@@ -4,8 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Neural ANPR & Blur Plate Reconstruction Engine</title>
-  <!-- ONNX Runtime Web -->
-  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
+  <!-- Stable ONNX Runtime Web 1.16.3 -->
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/ort.min.js"></script>
   <!-- OpenCV.js -->
   <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady()"></script>
   <!-- Tesseract.js -->
@@ -79,9 +79,10 @@
   </div>
 
   <script>
-    // Fix ONNX Runtime WASM binary CDN path
-    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
+    // Exact matching WASM binary path for 1.16.3
+    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/";
     ort.env.wasm.numThreads = 1;
+    ort.env.wasm.simd = false;
 
     let detectorSession = null;
     let enhancerSession = null;
@@ -97,12 +98,18 @@
     async function initModels() {
       try {
         statusEl.textContent = "Loading plate_detector.onnx...";
-        detectorSession = await ort.InferenceSession.create('./plate_detector.onnx', {
+        const detResp = await fetch('./plate_detector.onnx');
+        if (!detResp.ok) throw new Error("plate_detector.onnx HTTP " + detResp.status);
+        const detBuf = await detResp.arrayBuffer();
+        detectorSession = await ort.InferenceSession.create(detBuf, {
           executionProviders: ['wasm']
         });
 
         statusEl.textContent = "Loading pixel_enhancer.onnx...";
-        enhancerSession = await ort.InferenceSession.create('./pixel_enhancer.onnx', {
+        const enhResp = await fetch('./pixel_enhancer.onnx');
+        if (!enhResp.ok) throw new Error("pixel_enhancer.onnx HTTP " + enhResp.status);
+        const enhBuf = await enhResp.arrayBuffer();
+        enhancerSession = await ort.InferenceSession.create(enhBuf, {
           executionProviders: ['wasm']
         });
 
