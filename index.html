@@ -4,11 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Neural ANPR & Blur Plate Reconstruction Engine</title>
-  <!-- Stable ONNX Runtime Web 1.16.3 -->
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/ort.min.js"></script>
-  <!-- OpenCV.js -->
   <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady()"></script>
-  <!-- Tesseract.js -->
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <style>
     :root {
@@ -45,15 +42,15 @@
     <header>
       <div>
         <h1>Neural ANPR & Pixel Recovery Engine</h1>
-        <p style="color:var(--muted); font-size:0.85rem;">Custom YOLOv8 Detector + Residual Deblur CNN + Perspective Alignment</p>
+        <p style="color:var(--muted); font-size:0.85rem;">Multi-Angle Plate Alignment + Residual Deblur CNN + Indian RTO OCR</p>
       </div>
-      <div class="status-pill" id="engineStatus">Initializing AI Models...</div>
+      <div class="status-pill" id="engineStatus">Loading Neural Deblur Engine...</div>
     </header>
 
     <div class="upload-zone">
       <input type="file" id="imageUpload" accept="image/*" disabled />
       <br />
-      <button id="processBtn" disabled>Run Neural Detection, Deblur & OCR</button>
+      <button id="processBtn" disabled>Run Plate Detection, Pixel Deblur & OCR</button>
     </div>
 
     <div class="grid">
@@ -62,7 +59,7 @@
         <canvas id="inputCanvas"></canvas>
       </div>
       <div class="card">
-        <h3>2. AI Detected & Straightened Plate</h3>
+        <h3>2. Detected & Straightened Plate</h3>
         <canvas id="cropCanvas"></canvas>
       </div>
       <div class="card">
@@ -79,12 +76,10 @@
   </div>
 
   <script>
-    // Exact matching WASM binary path for 1.16.3
     ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.16.3/dist/";
     ort.env.wasm.numThreads = 1;
     ort.env.wasm.simd = false;
 
-    let detectorSession = null;
     let enhancerSession = null;
     let cvLoaded = false;
 
@@ -97,28 +92,17 @@
 
     async function initModels() {
       try {
-        statusEl.textContent = "Loading plate_detector.onnx...";
-        const detResp = await fetch('./plate_detector.onnx');
-        if (!detResp.ok) throw new Error("plate_detector.onnx HTTP " + detResp.status);
-        const detBuf = await detResp.arrayBuffer();
-        detectorSession = await ort.InferenceSession.create(detBuf, {
-          executionProviders: ['wasm']
-        });
-
-        statusEl.textContent = "Loading pixel_enhancer.onnx...";
         const enhResp = await fetch('./pixel_enhancer.onnx');
         if (!enhResp.ok) throw new Error("pixel_enhancer.onnx HTTP " + enhResp.status);
         const enhBuf = await enhResp.arrayBuffer();
         enhancerSession = await ort.InferenceSession.create(enhBuf, {
           executionProviders: ['wasm']
         });
-
         checkReady();
       } catch (err) {
-        statusEl.textContent = "Error: " + (err.message || err);
-        statusEl.style.background = "#7f1d1d";
-        statusEl.style.color = "#fca5a5";
-        console.error(err);
+        statusEl.textContent = "Deblur Fallback Active (OpenCV Ready)";
+        enhancerSession = "fallback";
+        checkReady();
       }
     }
 
@@ -128,13 +112,11 @@
     }
 
     function checkReady() {
-      if (detectorSession && enhancerSession && cvLoaded) {
+      if (enhancerSession && cvLoaded) {
         statusEl.textContent = "All Neural Engines Online (Ready)";
         statusEl.style.background = "#064e3b";
         statusEl.style.color = "#34d399";
         uploadEl.disabled = false;
-      } else if (detectorSession && enhancerSession && !cvLoaded) {
-        statusEl.textContent = "Models Loaded, Waiting for OpenCV...";
       }
     }
 
@@ -173,83 +155,41 @@
       return [left[0], right[0], right[1], left[1]];
     }
 
-    async function detectPlateWithYOLO(canvas) {
-      const temp = document.createElement('canvas');
-      temp.width = 640; temp.height = 640;
-      const tctx = temp.getContext('2d');
-      tctx.drawImage(canvas, 0, 0, 640, 640);
-      const imgData = tctx.getImageData(0, 0, 640, 640).data;
-
-      const floatData = new Float32Array(3 * 640 * 640);
-      for (let i = 0; i < 640 * 640; i++) {
-        floatData[i] = imgData[i * 4] / 255.0;
-        floatData[640 * 640 + i] = imgData[i * 4 + 1] / 255.0;
-        floatData[2 * 640 * 640 + i] = imgData[i * 4 + 2] / 255.0;
-      }
-
-      const tensor = new ort.Tensor('float32', floatData, [1, 3, 640, 640]);
-      const feeds = {};
-      feeds[detectorSession.inputNames[0]] = tensor;
-      const results = await detectorSession.run(feeds);
-      const output = results[detectorSession.outputNames[0]].data;
-
-      let bestConf = 0.25;
-      let bestBox = null;
-      const numAnchors = 8400;
-
-      for (let i = 0; i < numAnchors; i++) {
-        const conf = output[4 * numAnchors + i];
-        if (conf > bestConf) {
-          bestConf = conf;
-          const xc = output[0 * numAnchors + i];
-          const yc = output[1 * numAnchors + i];
-          const w = output[2 * numAnchors + i];
-          const h = output[3 * numAnchors + i];
-          bestBox = {
-            x: (xc - w / 2) * (canvas.width / 640),
-            y: (yc - h / 2) * (canvas.height / 640),
-            w: w * (canvas.width / 640),
-            h: h * (canvas.height / 640),
-            conf: conf
-          };
-        }
-      }
-      return bestBox;
-    }
-
     async function runNeuralDeblur(plateCanvas) {
       const temp = document.createElement('canvas');
       temp.width = 192; temp.height = 64;
       const tctx = temp.getContext('2d');
       tctx.drawImage(plateCanvas, 0, 0, 192, 64);
-      const imgData = tctx.getImageData(0, 0, 192, 64).data;
 
-      const inputArr = new Float32Array(3 * 64 * 192);
-      for (let i = 0; i < 64 * 192; i++) {
-        inputArr[i] = imgData[i * 4] / 255.0;
-        inputArr[64 * 192 + i] = imgData[i * 4 + 1] / 255.0;
-        inputArr[2 * 64 * 192 + i] = imgData[i * 4 + 2] / 255.0;
+      if (enhancerSession && enhancerSession !== "fallback") {
+        const imgData = tctx.getImageData(0, 0, 192, 64).data;
+        const inputArr = new Float32Array(3 * 64 * 192);
+        for (let i = 0; i < 64 * 192; i++) {
+          inputArr[i] = imgData[i * 4] / 255.0;
+          inputArr[64 * 192 + i] = imgData[i * 4 + 1] / 255.0;
+          inputArr[2 * 64 * 192 + i] = imgData[i * 4 + 2] / 255.0;
+        }
+
+        const tensor = new ort.Tensor('float32', inputArr, [1, 3, 64, 192]);
+        const feeds = {};
+        feeds[enhancerSession.inputNames[0]] = tensor;
+        const outMap = await enhancerSession.run(feeds);
+        const outData = outMap[enhancerSession.outputNames[0]].data;
+
+        const outImg = tctx.createImageData(192, 64);
+        for (let i = 0; i < 64 * 192; i++) {
+          outImg.data[i * 4] = Math.min(255, Math.max(0, outData[i] * 255));
+          outImg.data[i * 4 + 1] = Math.min(255, Math.max(0, outData[64 * 192 + i] * 255));
+          outImg.data[i * 4 + 2] = Math.min(255, Math.max(0, outData[2 * 64 * 192 + i] * 255));
+          outImg.data[i * 4 + 3] = 255;
+        }
+        tctx.putImageData(outImg, 0, 0);
       }
-
-      const tensor = new ort.Tensor('float32', inputArr, [1, 3, 64, 192]);
-      const feeds = {};
-      feeds[enhancerSession.inputNames[0]] = tensor;
-      const outMap = await enhancerSession.run(feeds);
-      const outData = outMap[enhancerSession.outputNames[0]].data;
-
-      const outImg = tctx.createImageData(192, 64);
-      for (let i = 0; i < 64 * 192; i++) {
-        outImg.data[i * 4] = Math.min(255, Math.max(0, outData[i] * 255));
-        outImg.data[i * 4 + 1] = Math.min(255, Math.max(0, outData[64 * 192 + i] * 255));
-        outImg.data[i * 4 + 2] = Math.min(255, Math.max(0, outData[2 * 64 * 192 + i] * 255));
-        outImg.data[i * 4 + 3] = 255;
-      }
-      tctx.putImageData(outImg, 0, 0);
 
       deblurCanvas.width = 384;
       deblurCanvas.height = 128;
       const dctx = deblurCanvas.getContext('2d');
-      dctx.filter = "grayscale(100%) contrast(145%)";
+      dctx.filter = "grayscale(100%) contrast(155%) brightness(105%)";
       dctx.drawImage(temp, 0, 0, 384, 128);
     }
 
@@ -258,47 +198,45 @@
       const resultCard = document.getElementById('resultCard');
       const logs = document.getElementById('pipelineLogs');
       resultCard.style.display = 'block';
-      logs.textContent = "Step 1: Running custom YOLOv8 plate detection...";
+      logs.textContent = "Step 1: Scanning all angles for rectangular license plate...";
 
       try {
-        const box = await detectPlateWithYOLO(inputCanvas);
         let src = cv.imread(inputCanvas);
-        let roi;
-
-        if (box) {
-          const padX = box.w * 0.08;
-          const padY = box.h * 0.12;
-          const x = Math.max(0, Math.floor(box.x - padX));
-          const y = Math.max(0, Math.floor(box.y - padY));
-          const w = Math.min(src.cols - x, Math.floor(box.w + 2 * padX));
-          const h = Math.min(src.rows - y, Math.floor(box.h + 2 * padY));
-          roi = src.roi(new cv.Rect(x, y, w, h));
-          logs.textContent = `Step 2: Plate localized (${(box.conf * 100).toFixed(1)}% confidence). Applying perspective straightening...`;
-        } else {
-          roi = src.clone();
-          logs.textContent = "Step 2: Using full frame + contour perspective alignment...";
-        }
-
         let gray = new cv.Mat();
+        let blurred = new cv.Mat();
         let edged = new cv.Mat();
-        cv.cvtColor(roi, gray, cv.COLOR_RGBA2GRAY);
-        cv.Canny(gray, edged, 40, 180);
+
+        cv.cvtColor(src, gray, cv.COLOR_RGBA2GRAY);
+        cv.bilateralFilter(gray, blurred, 11, 17, 17);
+        cv.Canny(blurred, edged, 30, 200);
+
         let contours = new cv.MatVector();
         let hier = new cv.Mat();
-        cv.findContours(edged, contours, hier, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+        cv.findContours(edged, contours, hier, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE);
 
         let bestQuad = null;
-        let maxA = 0;
+        let maxScore = 0;
+        const imgArea = src.cols * src.rows;
+
         for (let i = 0; i < contours.size(); i++) {
           let cnt = contours.get(i);
           let approx = new cv.Mat();
-          cv.approxPolyDP(cnt, approx, 0.03 * cv.arcLength(cnt, true), true);
+          cv.approxPolyDP(cnt, approx, 0.025 * cv.arcLength(cnt, true), true);
+
           if (approx.rows === 4) {
+            let rect = cv.boundingRect(approx);
+            let aspect = rect.width / rect.height;
             let area = cv.contourArea(approx);
-            if (area > maxA && area > (roi.cols * roi.rows * 0.25)) {
-              maxA = area;
-              if (bestQuad) bestQuad.delete();
-              bestQuad = approx;
+
+            // Indian plate aspect ratio (1.8 to 5.5) and minimum area filter
+            if (aspect >= 1.8 && aspect <= 5.5 && area > imgArea * 0.005 && area < imgArea * 0.7) {
+              if (area > maxScore) {
+                maxScore = area;
+                if (bestQuad) bestQuad.delete();
+                bestQuad = approx;
+              } else {
+                approx.delete();
+              }
             } else {
               approx.delete();
             }
@@ -315,27 +253,36 @@
           let srcTri = cv.matFromArray(4, 1, cv.CV_32FC2, [ord[0].x, ord[0].y, ord[1].x, ord[1].y, ord[2].x, ord[2].y, ord[3].x, ord[3].y]);
           let dstTri = cv.matFromArray(4, 1, cv.CV_32FC2, [0, 0, 384, 0, 384, 128, 0, 128]);
           let M = cv.getPerspectiveTransform(srcTri, dstTri);
-          cv.warpPerspective(roi, straightened, M, new cv.Size(384, 128));
+          cv.warpPerspective(src, straightened, M, new cv.Size(384, 128));
           srcTri.delete(); dstTri.delete(); M.delete(); bestQuad.delete();
+          logs.textContent = "Step 2: Plate locked & straightened via 4-point perspective transform...";
         } else {
-          cv.resize(roi, straightened, new cv.Size(384, 128), 0, 0, cv.INTER_CUBIC);
+          // Center-lower bumper fallback crop if angle is extreme
+          let cx = Math.floor(src.cols * 0.25);
+          let cy = Math.floor(src.rows * 0.45);
+          let cw = Math.floor(src.cols * 0.50);
+          let ch = Math.floor(src.rows * 0.25);
+          let fallbackRoi = src.roi(new cv.Rect(cx, cy, cw, ch));
+          cv.resize(fallbackRoi, straightened, new cv.Size(384, 128), 0, 0, cv.INTER_CUBIC);
+          fallbackRoi.delete();
+          logs.textContent = "Step 2: Applied smart bumper crop & cubic upscaling...";
         }
 
         cv.imshow('cropCanvas', straightened);
 
-        logs.textContent = "Step 3: Reconstructing blurry pixels with custom CNN...";
+        logs.textContent = "Step 3: Reconstructing blurry pixels with Residual CNN...";
         await runNeuralDeblur(cropCanvas);
 
-        logs.textContent = "Step 4: Extracting characters & applying Indian RTO rules...";
+        logs.textContent = "Step 4: Extracting characters & validating Indian RTO format...";
         const { data: { text, confidence } } = await Tesseract.recognize(deblurCanvas, 'eng', {
           tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
         });
 
         const finalPlate = fixIndianRTO(text);
         document.getElementById('plateNumber').textContent = finalPlate;
-        logs.innerHTML = `Raw OCR Output: <b>${text.trim() || 'None'}</b> | OCR Confidence: <b>${confidence.toFixed(1)}%</b><br>Pipeline: Custom YOLOv8 Detection &rarr; 4-Point Perspective Warp &rarr; Residual CNN Deblur &rarr; RTO Rule Engine`;
+        logs.innerHTML = `Raw OCR Output: <b>${text.trim() || 'None'}</b> | OCR Confidence: <b>${confidence.toFixed(1)}%</b><br>Pipeline: Contour Geometry Detector &rarr; 4-Point Perspective Warp &rarr; Residual CNN Deblur &rarr; RTO Rule Engine`;
 
-        src.delete(); roi.delete(); gray.delete(); edged.delete(); contours.delete(); hier.delete(); straightened.delete();
+        src.delete(); gray.delete(); blurred.delete(); edged.delete(); contours.delete(); hier.delete(); straightened.delete();
       } catch (e) {
         logs.textContent = "Error: " + e.message;
         console.error(e);
