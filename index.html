@@ -44,7 +44,7 @@
     <header>
       <div>
         <h1>Neural ANPR & Pixel Recovery Engine</h1>
-        <p style="color:var(--muted); font-size:0.83rem;">MinAreaRect Deskew + Residual CNN + Super-Resolution Pixel Reconstruction</p>
+        <p style="color:var(--muted); font-size:0.83rem;">MinAreaRect Deskew + Motion Deconvolution + Stroke Separation OCR</p>
       </div>
       <div class="status-pill" id="engineStatus">Loading Engines...</div>
     </header>
@@ -139,7 +139,6 @@
 
     function fixIndianRTO(raw) {
       let clean = raw.replace(/[^A-Z0-9]/gi, '').toUpperCase();
-      // Remove accidental IND prefix if captured
       if (clean.startsWith('IND') && clean.length > 9) clean = clean.slice(3);
       if (clean.length < 6 || clean.length > 10) return clean || "UNREADABLE";
 
@@ -147,80 +146,47 @@
       const n2c = { '0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B', '6': 'G' };
       const c2n = { 'O': '0', 'Q': '0', 'D': '0', 'I': '1', 'L': '1', 'Z': '2', 'S': '5', 'B': '8', 'G': '6' };
 
-      // Format: SS (0,1) DD (2,3) SERIES (4..len-5) NNNN (len-4..len-1)
       for (let i = 0; i < Math.min(2, chars.length); i++) if (n2c[chars[i]]) chars[i] = n2c[chars[i]];
       for (let i = 2; i < Math.min(4, chars.length); i++) if (c2n[chars[i]]) chars[i] = c2n[chars[i]];
       for (let i = 4; i < chars.length - 4; i++) if (n2c[chars[i]]) chars[i] = n2c[chars[i]];
       for (let i = Math.max(4, chars.length - 4); i < chars.length; i++) if (c2n[chars[i]]) chars[i] = c2n[chars[i]];
 
       const fixed = chars.join('');
-      // Format nicely as JH 02 BC 4819
       if (fixed.length === 10) return `${fixed.slice(0,2)} ${fixed.slice(2,4)} ${fixed.slice(4,6)} ${fixed.slice(6)}`;
       if (fixed.length === 9) return `${fixed.slice(0,2)} ${fixed.slice(2,4)} ${fixed.slice(4,5)} ${fixed.slice(5)}`;
       return fixed;
     }
 
     async function runNeuralDeblur(plateCanvas) {
-      const temp = document.createElement('canvas');
-      temp.width = 192; temp.height = 64;
-      const tctx = temp.getContext('2d');
-      tctx.drawImage(plateCanvas, 0, 0, 192, 64);
-
-      if (enhancerSession && enhancerSession !== "fallback") {
-        const imgData = tctx.getImageData(0, 0, 192, 64).data;
-        const inputArr = new Float32Array(3 * 64 * 192);
-        for (let i = 0; i < 64 * 192; i++) {
-          inputArr[i] = imgData[i * 4] / 255.0;
-          inputArr[64 * 192 + i] = imgData[i * 4 + 1] / 255.0;
-          inputArr[2 * 64 * 192 + i] = imgData[i * 4 + 2] / 255.0;
-        }
-        const tensor = new ort.Tensor('float32', inputArr, [1, 3, 64, 192]);
-        const feeds = {};
-        feeds[enhancerSession.inputNames[0]] = tensor;
-        const outMap = await enhancerSession.run(feeds);
-        const outData = outMap[enhancerSession.outputNames[0]].data;
-
-        const outImg = tctx.createImageData(192, 64);
-        for (let i = 0; i < 64 * 192; i++) {
-          outImg.data[i * 4] = Math.min(255, Math.max(0, outData[i] * 255));
-          outImg.data[i * 4 + 1] = Math.min(255, Math.max(0, outData[64 * 192 + i] * 255));
-          outImg.data[i * 4 + 2] = Math.min(255, Math.max(0, outData[2 * 64 * 192 + i] * 255));
-          outImg.data[i * 4 + 3] = 255;
-        }
-        tctx.putImageData(outImg, 0, 0);
-      }
-
-      // HD Pixel Reconstruction Pipeline (600x200 Super-Resolution)
       let mat = cv.imread(plateCanvas);
       let up = new cv.Mat();
       let gray = new cv.Mat();
       let deconv = new cv.Mat();
+      let binary = new cv.Mat();
+      let separated = new cv.Mat();
       let smooth = new cv.Mat();
-      let crisp = new cv.Mat();
 
-      // 1. Lanczos4 Super-Resolution Upscaling
-      cv.resize(mat, up, new cv.Size(600, 200), 0, 0, cv.INTER_LANCZOS4);
+      // 1. Upscale to 640x200
+      cv.resize(mat, up, new cv.Size(640, 200), 0, 0, cv.INTER_CUBIC);
       cv.cvtColor(up, gray, cv.COLOR_RGBA2GRAY);
 
-      // 2. Directional Motion Deconvolution (Collapses horizontal blur)
-      let hKernel = cv.matFromArray(1, 9, cv.CV_32F, [-0.15, -0.3, -0.5, -0.7, 4.3, -0.7, -0.5, -0.3, -0.15]);
+      // 2. Strong Horizontal Deconvolution Kernel to strip motion blur tails
+      let hKernel = cv.matFromArray(1, 9, cv.CV_32F, [-0.2, -0.4, -0.7, -1.0, 5.6, -1.0, -0.7, -0.4, -0.2]);
       cv.filter2D(gray, deconv, cv.CV_8U, hKernel);
 
-      // 3. Morphological Dilation (Thins smeared black strokes cleanly)
-      let thinned = new cv.Mat();
-      let mKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(4, 2));
-      cv.dilate(deconv, thinned, mKernel);
+      // 3. Otsu Thresholding
+      cv.threshold(deconv, binary, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
 
-      // 4. Edge-Preserving Bilateral Smoothing + S-Curve Contrast (Removes jagged pixels!)
-      cv.bilateralFilter(thinned, smooth, 9, 75, 75);
-      let blurMask = new cv.Mat();
-      cv.GaussianBlur(smooth, blurMask, new cv.Size(0, 0), 2.0);
-      cv.addWeighted(smooth, 1.85, blurMask, -0.85, 0, crisp);
-      cv.normalize(crisp, crisp, 0, 255, cv.NORM_MINMAX);
+      // 4. Horizontal White Dilation (7x2) -> Cuts horizontal blur bridges between 4, 8, 1, 9!
+      let sepKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 2));
+      cv.dilate(binary, separated, sepKernel);
 
-      cv.imshow('deblurCanvas', crisp);
+      // 5. Slight anti-aliased smoothing so edges look clean and readable
+      cv.GaussianBlur(separated, smooth, new cv.Size(3, 3), 0.8);
 
-      mat.delete(); up.delete(); gray.delete(); deconv.delete(); smooth.delete(); crisp.delete(); thinned.delete(); blurMask.delete(); hKernel.delete(); mKernel.delete();
+      cv.imshow('deblurCanvas', smooth);
+
+      mat.delete(); up.delete(); gray.delete(); deconv.delete(); binary.delete(); separated.delete(); smooth.delete(); hKernel.delete(); sepKernel.delete();
     }
 
     processBtn.addEventListener('click', async () => {
@@ -229,6 +195,7 @@
       const resultCard = document.getElementById('resultCard');
       const logs = document.getElementById('pipelineLogs');
       resultCard.style.display = 'block';
+      document.getElementById('plateNumber').textContent = "SCANNING...";
       logs.textContent = "Step 1: Isolating license plate & deskewing tilt angle...";
 
       try {
@@ -273,30 +240,34 @@
           let rotated = new cv.Mat();
           cv.warpAffine(src, rotated, M, new cv.Size(src.cols, src.rows), cv.INTER_CUBIC, cv.BORDER_REPLICATE);
 
+          // Full width crop (skip only the left 8% blue IND band so 'J' is never clipped!)
           let x = Math.max(0, Math.floor(bestRect.center.x - bestRect.width * 0.42));
-          let y = Math.max(0, Math.floor(bestRect.center.y - bestRect.height * 0.43));
-          let w = Math.min(rotated.cols - x, Math.floor(bestRect.width * 0.88));
-          let h = Math.min(rotated.rows - y, Math.floor(bestRect.height * 0.86));
+          let y = Math.max(0, Math.floor(bestRect.center.y - bestRect.height * 0.42));
+          let w = Math.min(rotated.cols - x, Math.floor(bestRect.width * 0.90));
+          let h = Math.min(rotated.rows - y, Math.floor(bestRect.height * 0.84));
 
           let cropped = rotated.roi(new cv.Rect(x, y, w, h));
-          cv.resize(cropped, straightened, new cv.Size(600, 200), 0, 0, cv.INTER_LANCZOS4);
+          cv.resize(cropped, straightened, new cv.Size(640, 200), 0, 0, cv.INTER_CUBIC);
           M.delete(); rotated.delete(); cropped.delete();
-          logs.textContent = `Step 2: Plate deskewed (${bestRect.angle.toFixed(1)}° corrected). Reconstructing HD pixels...`;
+          logs.textContent = `Step 2: Plate deskewed (${bestRect.angle.toFixed(1)}° corrected). Separating smeared characters...`;
         } else {
-          cv.resize(src, straightened, new cv.Size(600, 200), 0, 0, cv.INTER_LANCZOS4);
+          cv.resize(src, straightened, new cv.Size(640, 200), 0, 0, cv.INTER_CUBIC);
         }
 
         cv.imshow('cropCanvas', straightened);
         await runNeuralDeblur(cropCanvas);
 
-        logs.textContent = "Step 3: Running Multi-Pass Neural OCR & Indian RTO Syntax Validation...";
-        const { data: { text, confidence } } = await Tesseract.recognize(deblurCanvas, 'eng', {
-          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+        logs.textContent = "Step 3: Running Tesseract OCR on reconstructed PNG buffer...";
+        // Pass PNG data URL so Tesseract v5 never gets a blank canvas buffer!
+        const pngDataUrl = deblurCanvas.toDataURL('image/png');
+        const { data: { text, confidence } } = await Tesseract.recognize(pngDataUrl, 'eng', {
+          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+          tessedit_pageseg_mode: '7'
         });
 
         const finalPlate = fixIndianRTO(text);
         document.getElementById('plateNumber').textContent = finalPlate;
-        logs.innerHTML = `Raw OCR Read: <b>${text.trim() || 'None'}</b> | Confidence: <b>${confidence.toFixed(1)}%</b><br>Pipeline: MinAreaRect Deskew &rarr; Lanczos4 2x Super-Res &rarr; Motion Deconvolution &rarr; Bilateral Pixel Smoothing &rarr; RTO Rule Engine`;
+        logs.innerHTML = `Raw OCR Read: <b>${text.trim() || 'None'}</b> | Confidence: <b>${confidence.toFixed(1)}%</b><br>Pipeline: MinAreaRect Deskew &rarr; 1D Motion Deconvolution &rarr; Horizontal Stroke Separation &rarr; RTO Rule Engine`;
 
         src.delete(); gray.delete(); thresh.delete(); contours.delete(); hier.delete(); straightened.delete();
       } catch (e) {
