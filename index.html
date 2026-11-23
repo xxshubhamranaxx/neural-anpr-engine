@@ -44,7 +44,7 @@
     <header>
       <div>
         <h1>Neural ANPR & Pixel Recovery Engine</h1>
-        <p style="color:var(--muted); font-size:0.83rem;">MinAreaRect Deskew + Smooth Edge Reconstruction + Dual-Pass RTO OCR</p>
+        <p style="color:var(--muted); font-size:0.83rem;">MinAreaRect Deskew + Smooth Edge Reconstruction + Tesseract v5 Worker</p>
       </div>
       <div class="status-pill" id="engineStatus">Loading Engines...</div>
     </header>
@@ -85,6 +85,7 @@
     ort.env.wasm.simd = false;
 
     let enhancerSession = null;
+    let ocrWorker = null;
     let imageReady = false;
 
     const statusEl = document.getElementById('engineStatus');
@@ -100,7 +101,7 @@
     }
 
     function updateStatus() {
-      if (enhancerSession && isCvReady()) {
+      if (enhancerSession && ocrWorker && isCvReady()) {
         statusEl.textContent = "All Neural Engines Online (Ready)";
         if (imageReady) processBtn.disabled = false;
       }
@@ -110,7 +111,7 @@
       if (isCvReady()) { clearInterval(cvCheckTimer); updateStatus(); }
     }, 300);
 
-    async function initModels() {
+    async function initEngines() {
       try {
         const enhResp = await fetch('./pixel_enhancer.onnx');
         if (!enhResp.ok) throw new Error("HTTP " + enhResp.status);
@@ -118,9 +119,17 @@
       } catch (err) {
         enhancerSession = "fallback";
       }
+
+      // Proper Tesseract v5 Worker initialization
+      ocrWorker = await Tesseract.createWorker('eng');
+      await ocrWorker.setParameters({
+        tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
+        tessedit_pageseg_mode: Tesseract.PSM.SINGLE_LINE
+      });
+
       updateStatus();
     }
-    initModels();
+    initEngines();
 
     uploadEl.addEventListener('change', (e) => {
       const file = e.target.files[0];
@@ -132,7 +141,7 @@
         inputCanvas.height = img.height;
         inputCanvas.getContext('2d').drawImage(img, 0, 0);
         imageReady = true;
-        processBtn.disabled = false;
+        if (ocrWorker && isCvReady()) processBtn.disabled = false;
       };
       img.src = URL.createObjectURL(file);
     });
@@ -168,19 +177,17 @@
       let sharp = new cv.Mat();
       let norm = new cv.Mat();
 
-      // 1. Lanczos4 Super-Resolution Upscale (640x200)
-      cv.resize(mat, up, new cv.Size(640, 200), 0, 0, cv.INTER_LANCZOS4);
+      // 1. Lanczos4 Super-Resolution Upscale (640x180)
+      cv.resize(mat, up, new cv.Size(640, 180), 0, 0, cv.INTER_LANCZOS4);
       cv.cvtColor(up, gray, cv.COLOR_RGBA2GRAY);
 
-      // 2. Edge-Preserving Bilateral Filter (Removes noise without losing stroke edges)
+      // 2. Edge-Preserving Bilateral Filter
       cv.bilateralFilter(gray, smooth, 7, 50, 50);
 
-      // 3. Clean Unsharp Mask (No ringing dots, pure smooth anti-aliased strokes!)
+      // 3. Clean Unsharp Mask + Contrast Stretch (Crisp dark characters on clean white background)
       let gauss = new cv.Mat();
       cv.GaussianBlur(smooth, gauss, new cv.Size(0, 0), 3.0);
-      cv.addWeighted(smooth, 2.1, gauss, -1.1, 0, sharp);
-
-      // 4. Full Dynamic Range Normalization (Crisp dark text on clean white plate)
+      cv.addWeighted(smooth, 2.3, gauss, -1.3, 0, sharp);
       cv.normalize(sharp, norm, 0, 255, cv.NORM_MINMAX);
 
       cv.imshow('deblurCanvas', norm);
@@ -189,13 +196,13 @@
     }
 
     processBtn.addEventListener('click', async () => {
-      if (!isCvReady()) return;
+      if (!isCvReady() || !ocrWorker) return;
       processBtn.disabled = true;
       const resultCard = document.getElementById('resultCard');
       const logs = document.getElementById('pipelineLogs');
       resultCard.style.display = 'block';
       document.getElementById('plateNumber').textContent = "SCANNING...";
-      logs.textContent = "Step 1: Isolating full license plate & deskewing tilt angle...";
+      logs.textContent = "Step 1: Isolating license plate & deskewing tilt angle...";
 
       try {
         let src = cv.imread(inputCanvas);
@@ -239,48 +246,41 @@
           let rotated = new cv.Mat();
           cv.warpAffine(src, rotated, M, new cv.Size(src.cols, src.rows), cv.INTER_CUBIC, cv.BORDER_REPLICATE);
 
+          // Full width (0.495) + tighter vertical crop (0.38) to remove top/bottom dark bars
           let x = Math.max(0, Math.floor(bestRect.center.x - bestRect.width * 0.495));
-          let y = Math.max(0, Math.floor(bestRect.center.y - bestRect.height * 0.44));
+          let y = Math.max(0, Math.floor(bestRect.center.y - bestRect.height * 0.38));
           let w = Math.min(rotated.cols - x, Math.floor(bestRect.width * 0.99));
-          let h = Math.min(rotated.rows - y, Math.floor(bestRect.height * 0.88));
+          let h = Math.min(rotated.rows - y, Math.floor(bestRect.height * 0.76));
 
           let cropped = rotated.roi(new cv.Rect(x, y, w, h));
-          cv.resize(cropped, straightened, new cv.Size(640, 200), 0, 0, cv.INTER_LANCZOS4);
+          cv.resize(cropped, straightened, new cv.Size(640, 180), 0, 0, cv.INTER_LANCZOS4);
           M.delete(); rotated.delete(); cropped.delete();
-          logs.textContent = `Step 2: Full plate deskewed (${bestRect.angle.toFixed(1)}° corrected). Reconstructing smooth HD pixels...`;
+          logs.textContent = `Step 2: Plate deskewed (${bestRect.angle.toFixed(1)}° corrected). Reconstructing HD pixels...`;
         } else {
-          cv.resize(src, straightened, new cv.Size(640, 200), 0, 0, cv.INTER_LANCZOS4);
+          cv.resize(src, straightened, new cv.Size(640, 180), 0, 0, cv.INTER_LANCZOS4);
         }
 
         cv.imshow('cropCanvas', straightened);
         await runNeuralDeblur(cropCanvas);
 
-        logs.textContent = "Step 3: Running Dual-Pass OCR & Indian RTO Validation...";
-        const pass1 = await Tesseract.recognize(deblurCanvas.toDataURL('image/png'), 'eng', {
-          tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-          tessedit_pageseg_mode: '7'
-        });
-
-        let bestText = pass1.data.text;
-        let bestConf = pass1.data.confidence;
+        logs.textContent = "Step 3: Running Tesseract v5 Worker OCR & RTO Syntax Engine...";
+        const ret1 = await ocrWorker.recognize(deblurCanvas);
+        let bestText = ret1.data.text;
+        let bestConf = ret1.data.confidence;
         let parsed = fixIndianRTO(bestText);
 
-        // Fallback pass on straightened plate if pass 1 didn't match valid RTO pattern
         if (!parsed.valid) {
-          const pass2 = await Tesseract.recognize(cropCanvas.toDataURL('image/png'), 'eng', {
-            tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
-            tessedit_pageseg_mode: '7'
-          });
-          const parsed2 = fixIndianRTO(pass2.data.text);
-          if (parsed2.valid || pass2.data.confidence > bestConf) {
-            bestText = pass2.data.text;
-            bestConf = pass2.data.confidence;
+          const ret2 = await ocrWorker.recognize(cropCanvas);
+          const parsed2 = fixIndianRTO(ret2.data.text);
+          if (parsed2.valid || ret2.data.confidence > bestConf) {
+            bestText = ret2.data.text;
+            bestConf = ret2.data.confidence;
             parsed = parsed2;
           }
         }
 
         document.getElementById('plateNumber').textContent = parsed.formatted;
-        logs.innerHTML = `Raw OCR Read: <b>${bestText.trim() || 'None'}</b> | Confidence: <b>${bestConf.toFixed(1)}%</b><br>Pipeline: Full-Width Deskew &rarr; Lanczos4 Super-Res &rarr; Unsharp Edge Reconstruction &rarr; Dual-Pass RTO OCR`;
+        logs.innerHTML = `Raw OCR Read: <b>${bestText.trim() || 'None'}</b> | Confidence: <b>${bestConf.toFixed(1)}%</b><br>Pipeline: Inner-Plate Deskew &rarr; Lanczos4 Super-Res &rarr; Unsharp Reconstruction &rarr; Tesseract v5 Worker`;
 
         src.delete(); gray.delete(); thresh.delete(); contours.delete(); hier.delete(); straightened.delete();
       } catch (e) {
