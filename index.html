@@ -372,9 +372,9 @@ $('run').addEventListener('click', async () => {
     if (cands.length) {
       const c = cands[0], fmt = formatPlate(c.plate);
       if (wmats[c.r.n]) cv.imshow($('cHD'), wmats[c.r.n]); else if (wmats[c.r.n.replace('-otsu', '')]) cv.imshow($('cHD'), wmats[c.r.n.replace('-otsu', '')]);
-      $('plateTxt').textContent = fmt; $('fmt').textContent = fmt;
+      const low = c.r.conf < 50; $('plateTxt').textContent = fmt; $('fmt').textContent = low ? fmt + ' (unverified guess)' : fmt;
       $('raw').textContent = c.r.text.trim().replace(/\s+/g, ' ') || '-'; $('conf').textContent = c.r.conf.toFixed(1) + '%';
-      $('note').textContent = `Best match from "${c.r.n}" pass, agreed by ${votes[c.plate]} of ${results.length} passes.` + (STATES.has(c.state) ? '' : ' The state code is not a known RTO code, so check the result.');
+      $('note').textContent = `Best match from "${c.r.n}" pass, agreed by ${votes[c.plate]} of ${results.length} passes.` + (STATES.has(c.state) ? '' : ' The state code is not a known RTO code, so check the result.') + (low ? ' OCR confidence is very low, so this is a pattern-corrected guess, not a reliable read.' : '');
     } else {
       const top = results.slice().sort((a, b) => b.conf - a.conf)[0];
       $('plateTxt').textContent = '-- -- -- ----'; $('fmt').textContent = 'No valid registration pattern read';
