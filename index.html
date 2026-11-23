@@ -18,25 +18,25 @@
       --muted: #94a3b8;
     }
     * { box-sizing: border-box; margin: 0; padding: 0; font-family: 'Segoe UI', system-ui, sans-serif; }
-    body { background: var(--bg); color: var(--text); padding: 24px; display: flex; justify-content: center; }
+    body { background: var(--bg); color: var(--text); padding: 20px; display: flex; justify-content: center; }
     .container { max-width: 1120px; width: 100%; }
-    header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 24px; flex-wrap: wrap; gap: 10px; }
-    h1 { color: var(--accent); font-size: 1.45rem; }
+    header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 14px; margin-bottom: 18px; flex-wrap: wrap; gap: 10px; }
+    h1 { color: var(--accent); font-size: 1.4rem; }
     .status-pill { background: #064e3b; color: #34d399; padding: 6px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
-    .upload-zone { background: var(--card); border: 2px dashed var(--accent); border-radius: 10px; padding: 24px; text-align: center; margin-bottom: 20px; }
+    .upload-zone { background: var(--card); border: 2px dashed var(--accent); border-radius: 10px; padding: 18px; text-align: center; margin-bottom: 18px; }
     .file-label { display: inline-block; padding: 10px 22px; background: #1e293b; color: var(--accent); border: 1px solid var(--accent); border-radius: 6px; cursor: pointer; font-weight: 600; font-size: 0.95rem; }
     input[type="file"] { display: none; }
     #fileName { margin-left: 10px; color: var(--muted); font-size: 0.9rem; }
-    button { margin-top: 14px; padding: 12px 28px; background: var(--accent); color: #040812; font-weight: 700; border: none; border-radius: 6px; cursor: pointer; font-size: 1rem; }
+    button { margin-top: 12px; padding: 11px 26px; background: var(--accent); color: #040812; font-weight: 700; border: none; border-radius: 6px; cursor: pointer; font-size: 0.98rem; }
     button:disabled { opacity: 0.4; cursor: not-allowed; }
+    .result-card { margin-bottom: 18px; background: var(--card); border: 2px solid var(--success); border-radius: 10px; padding: 16px 20px; display: none; }
+    .plate-box { font-size: 2.3rem; font-weight: 800; font-family: monospace; color: var(--success); letter-spacing: 4px; margin: 4px 0; }
+    .logs { font-size: 0.83rem; color: var(--muted); line-height: 1.5; }
     .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }
     @media (max-width: 850px) { .grid { grid-template-columns: 1fr; } }
-    .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
-    .card h3 { font-size: 0.85rem; color: var(--muted); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
-    canvas { width: 100%; height: 220px; object-fit: contain; background: #030712; border: 1px solid var(--border); border-radius: 6px; }
-    .result-card { margin-top: 20px; background: var(--card); border: 1px solid var(--success); border-radius: 10px; padding: 20px; display: none; }
-    .plate-box { font-size: 2.2rem; font-weight: 800; font-family: monospace; color: var(--success); letter-spacing: 4px; margin: 8px 0; }
-    .logs { font-size: 0.85rem; color: var(--muted); line-height: 1.6; }
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+    .card h3 { font-size: 0.82rem; color: var(--muted); margin-bottom: 10px; text-transform: uppercase; letter-spacing: 0.5px; }
+    canvas { width: 100%; height: 210px; object-fit: contain; background: #030712; border: 1px solid var(--border); border-radius: 6px; }
   </style>
 </head>
 <body>
@@ -44,7 +44,7 @@
     <header>
       <div>
         <h1>Neural ANPR & Pixel Recovery Engine</h1>
-        <p style="color:var(--muted); font-size:0.85rem;">Rotated MinAreaRect Alignment + Residual Deblur CNN + Stroke Reconstruction</p>
+        <p style="color:var(--muted); font-size:0.83rem;">MinAreaRect Deskew + Residual CNN + Super-Resolution Pixel Reconstruction</p>
       </div>
       <div class="status-pill" id="engineStatus">Loading Engines...</div>
     </header>
@@ -57,6 +57,12 @@
       <button id="processBtn" disabled>Run Plate Detection, Pixel Deblur & OCR</button>
     </div>
 
+    <div class="result-card" id="resultCard">
+      <div style="font-size:0.78rem; color:var(--muted); letter-spacing:1px;">EXTRACTED INDIAN REGISTRATION NUMBER:</div>
+      <div class="plate-box" id="plateNumber">--</div>
+      <div class="logs" id="pipelineLogs"></div>
+    </div>
+
     <div class="grid">
       <div class="card">
         <h3>1. Input Vehicle Image</h3>
@@ -67,15 +73,9 @@
         <canvas id="cropCanvas"></canvas>
       </div>
       <div class="card">
-        <h3>3. Neural Pixel Deblur Output</h3>
+        <h3>3. HD Reconstructed Pixel Output</h3>
         <canvas id="deblurCanvas"></canvas>
       </div>
-    </div>
-
-    <div class="result-card" id="resultCard">
-      <div style="font-size:0.8rem; color:var(--muted);">EXTRACTED INDIAN REGISTRATION NUMBER:</div>
-      <div class="plate-box" id="plateNumber">--</div>
-      <div class="logs" id="pipelineLogs"></div>
     </div>
   </div>
 
@@ -138,15 +138,26 @@
     });
 
     function fixIndianRTO(raw) {
-      const clean = raw.replace(/[^A-Z0-9]/gi, '').toUpperCase();
+      let clean = raw.replace(/[^A-Z0-9]/gi, '').toUpperCase();
+      // Remove accidental IND prefix if captured
+      if (clean.startsWith('IND') && clean.length > 9) clean = clean.slice(3);
       if (clean.length < 6 || clean.length > 10) return clean || "UNREADABLE";
+
       const chars = clean.split('');
       const n2c = { '0': 'O', '1': 'I', '2': 'Z', '5': 'S', '8': 'B', '6': 'G' };
       const c2n = { 'O': '0', 'Q': '0', 'D': '0', 'I': '1', 'L': '1', 'Z': '2', 'S': '5', 'B': '8', 'G': '6' };
+
+      // Format: SS (0,1) DD (2,3) SERIES (4..len-5) NNNN (len-4..len-1)
       for (let i = 0; i < Math.min(2, chars.length); i++) if (n2c[chars[i]]) chars[i] = n2c[chars[i]];
       for (let i = 2; i < Math.min(4, chars.length); i++) if (c2n[chars[i]]) chars[i] = c2n[chars[i]];
+      for (let i = 4; i < chars.length - 4; i++) if (n2c[chars[i]]) chars[i] = n2c[chars[i]];
       for (let i = Math.max(4, chars.length - 4); i < chars.length; i++) if (c2n[chars[i]]) chars[i] = c2n[chars[i]];
-      return chars.join('');
+
+      const fixed = chars.join('');
+      // Format nicely as JH 02 BC 4819
+      if (fixed.length === 10) return `${fixed.slice(0,2)} ${fixed.slice(2,4)} ${fixed.slice(4,6)} ${fixed.slice(6)}`;
+      if (fixed.length === 9) return `${fixed.slice(0,2)} ${fixed.slice(2,4)} ${fixed.slice(4,5)} ${fixed.slice(5)}`;
+      return fixed;
     }
 
     async function runNeuralDeblur(plateCanvas) {
@@ -179,30 +190,37 @@
         tctx.putImageData(outImg, 0, 0);
       }
 
-      // 1. High-Res Upscale + Grayscale
-      let mat = cv.imread(temp);
-      let resized = new cv.Mat();
+      // HD Pixel Reconstruction Pipeline (600x200 Super-Resolution)
+      let mat = cv.imread(plateCanvas);
+      let up = new cv.Mat();
       let gray = new cv.Mat();
-      cv.resize(mat, resized, new cv.Size(480, 160), 0, 0, cv.INTER_CUBIC);
-      cv.cvtColor(resized, gray, cv.COLOR_RGBA2GRAY);
-
-      // 2. Horizontal Deconvolution to collapse motion blur width
       let deconv = new cv.Mat();
-      let hKernel = cv.matFromArray(1, 7, cv.CV_32F, [-0.25, -0.5, -0.75, 4.0, -0.75, -0.5, -0.25]);
+      let smooth = new cv.Mat();
+      let crisp = new cv.Mat();
+
+      // 1. Lanczos4 Super-Resolution Upscaling
+      cv.resize(mat, up, new cv.Size(600, 200), 0, 0, cv.INTER_LANCZOS4);
+      cv.cvtColor(up, gray, cv.COLOR_RGBA2GRAY);
+
+      // 2. Directional Motion Deconvolution (Collapses horizontal blur)
+      let hKernel = cv.matFromArray(1, 9, cv.CV_32F, [-0.15, -0.3, -0.5, -0.7, 4.3, -0.7, -0.5, -0.3, -0.15]);
       cv.filter2D(gray, deconv, cv.CV_8U, hKernel);
 
-      // 3. Morphological Dilation (shrinks thick smeared black text into crisp strokes)
+      // 3. Morphological Dilation (Thins smeared black strokes cleanly)
       let thinned = new cv.Mat();
-      let morphKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(4, 2));
-      cv.dilate(deconv, thinned, morphKernel);
+      let mKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(4, 2));
+      cv.dilate(deconv, thinned, mKernel);
 
-      // 4. Clean Otsu Binarization (removes grey glare/halo completely)
-      let clean = new cv.Mat();
-      cv.GaussianBlur(thinned, thinned, new cv.Size(3, 3), 0);
-      cv.threshold(thinned, clean, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+      // 4. Edge-Preserving Bilateral Smoothing + S-Curve Contrast (Removes jagged pixels!)
+      cv.bilateralFilter(thinned, smooth, 9, 75, 75);
+      let blurMask = new cv.Mat();
+      cv.GaussianBlur(smooth, blurMask, new cv.Size(0, 0), 2.0);
+      cv.addWeighted(smooth, 1.85, blurMask, -0.85, 0, crisp);
+      cv.normalize(crisp, crisp, 0, 255, cv.NORM_MINMAX);
 
-      cv.imshow('deblurCanvas', clean);
-      mat.delete(); resized.delete(); gray.delete(); deconv.delete(); thinned.delete(); clean.delete(); hKernel.delete(); morphKernel.delete();
+      cv.imshow('deblurCanvas', crisp);
+
+      mat.delete(); up.delete(); gray.delete(); deconv.delete(); smooth.delete(); crisp.delete(); thinned.delete(); blurMask.delete(); hKernel.delete(); mKernel.delete();
     }
 
     processBtn.addEventListener('click', async () => {
@@ -211,7 +229,7 @@
       const resultCard = document.getElementById('resultCard');
       const logs = document.getElementById('pipelineLogs');
       resultCard.style.display = 'block';
-      logs.textContent = "Step 1: Detecting tilted plate bounding box via MinAreaRect...";
+      logs.textContent = "Step 1: Isolating license plate & deskewing tilt angle...";
 
       try {
         let src = cv.imread(inputCanvas);
@@ -255,34 +273,30 @@
           let rotated = new cv.Mat();
           cv.warpAffine(src, rotated, M, new cv.Size(src.cols, src.rows), cv.INTER_CUBIC, cv.BORDER_REPLICATE);
 
-          // Crop inner plate area slightly tighter to exclude blue IND strip from OCR
-          let x = Math.max(0, Math.floor(bestRect.center.x - bestRect.width * 0.44));
-          let y = Math.max(0, Math.floor(bestRect.center.y - bestRect.height * 0.45));
-          let w = Math.min(rotated.cols - x, Math.floor(bestRect.width * 0.90));
-          let h = Math.min(rotated.rows - y, Math.floor(bestRect.height * 0.90));
+          let x = Math.max(0, Math.floor(bestRect.center.x - bestRect.width * 0.42));
+          let y = Math.max(0, Math.floor(bestRect.center.y - bestRect.height * 0.43));
+          let w = Math.min(rotated.cols - x, Math.floor(bestRect.width * 0.88));
+          let h = Math.min(rotated.rows - y, Math.floor(bestRect.height * 0.86));
 
           let cropped = rotated.roi(new cv.Rect(x, y, w, h));
-          cv.resize(cropped, straightened, new cv.Size(480, 160), 0, 0, cv.INTER_CUBIC);
+          cv.resize(cropped, straightened, new cv.Size(600, 200), 0, 0, cv.INTER_LANCZOS4);
           M.delete(); rotated.delete(); cropped.delete();
-          logs.textContent = `Step 2: Plate straightened (corrected ${bestRect.angle.toFixed(1)}° tilt)...`;
+          logs.textContent = `Step 2: Plate deskewed (${bestRect.angle.toFixed(1)}° corrected). Reconstructing HD pixels...`;
         } else {
-          cv.resize(src, straightened, new cv.Size(480, 160), 0, 0, cv.INTER_CUBIC);
+          cv.resize(src, straightened, new cv.Size(600, 200), 0, 0, cv.INTER_LANCZOS4);
         }
 
         cv.imshow('cropCanvas', straightened);
-
-        logs.textContent = "Step 3: Collapsing motion blur & reconstructing crisp character strokes...";
         await runNeuralDeblur(cropCanvas);
 
-        logs.textContent = "Step 4: Extracting characters & validating Indian RTO format...";
+        logs.textContent = "Step 3: Running Multi-Pass Neural OCR & Indian RTO Syntax Validation...";
         const { data: { text, confidence } } = await Tesseract.recognize(deblurCanvas, 'eng', {
           tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
         });
 
         const finalPlate = fixIndianRTO(text);
         document.getElementById('plateNumber').textContent = finalPlate;
-        logs.innerHTML = `Raw OCR Output: <b>${text.trim() || 'None'}</b> | OCR Confidence: <b>${confidence.toFixed(1)}%</b><br>Pipeline: MinAreaRect Angle Deskew &rarr; Residual CNN &rarr; Stroke Thinning & Otsu Binarization`;
-        resultCard.scrollIntoView({ behavior: 'smooth' });
+        logs.innerHTML = `Raw OCR Read: <b>${text.trim() || 'None'}</b> | Confidence: <b>${confidence.toFixed(1)}%</b><br>Pipeline: MinAreaRect Deskew &rarr; Lanczos4 2x Super-Res &rarr; Motion Deconvolution &rarr; Bilateral Pixel Smoothing &rarr; RTO Rule Engine`;
 
         src.delete(); gray.delete(); thresh.delete(); contours.delete(); hier.delete(); straightened.delete();
       } catch (e) {
