@@ -251,7 +251,7 @@ async function onnxEnhance(g) {
 }
 
 /* Wiener deconvolution for horizontal motion blur (PSF = box of length L) */
-function wiener(g8, L, K) {
+function wiener(g8, L, K, norm) {
   const w = g8.cols, h = g8.rows, p = L * 2 + 8;
   const f = new cv.Mat(); g8.convertTo(f, cv.CV_32F, 1 / 255);
   const pd = new cv.Mat(); cv.copyMakeBorder(f, pd, 0, 0, p, p, cv.BORDER_REPLICATE);
@@ -267,9 +267,34 @@ function wiener(g8, L, K) {
   }
   const out = new cv.Mat(); cv.dft(G, out, cv.DFT_INVERSE | cv.DFT_SCALE | cv.DFT_REAL_OUTPUT);
   const roi = out.roi(new cv.Rect(p, 0, w, h)), n = new cv.Mat(); roi.convertTo(n, cv.CV_8U, 255);
-  cv.normalize(n, n, 0, 255, cv.NORM_MINMAX);
+  if (norm !== false) cv.normalize(n, n, 0, 255, cv.NORM_MINMAX);
   const res = n.clone(); del(f, pd, pd2, psf, G, P, out, roi, n);
   return res;
+}
+
+/* Estimate horizontal box-blur length from the 2nd-derivative autocorrelation (negative peak at lag L) */
+function estimateBlur(src) {
+  const g = new cv.Mat(); cv.cvtColor(src, g, cv.COLOR_RGBA2GRAY);
+  const w = g.cols, h = g.rows, d = g.data, maxLag = Math.min(60, Math.floor(w / 4)), ac = new Float64Array(maxLag + 1);
+  let e0 = 0;
+  for (let y = 0; y < h; y += 2) {
+    const o = y * w;
+    for (let x = 1; x < w - 1; x++) {
+      const a = d[o + x - 1] - 2 * d[o + x] + d[o + x + 1]; e0 += a * a;
+      for (let l = 3; l <= maxLag && x + l < w - 1; l++) ac[l] += a * (d[o + x + l - 1] - 2 * d[o + x + l] + d[o + x + l + 1]);
+    }
+  }
+  del(g);
+  let bl = 0, bv = 0;
+  for (let l = 3; l <= maxLag; l++) { const v = ac[l] / (e0 || 1); if (v < bv) { bv = v; bl = l; } }
+  return { L: bl, v: bv, blurred: bv < -0.08 };
+}
+function deblurImage(src, L) {
+  const ch = new cv.MatVector(), out = new cv.MatVector(), m = new cv.Mat();
+  cv.split(src, ch);
+  for (let i = 0; i < 3; i++) out.push_back(wiener(ch.get(i), L, 0.003, false));
+  out.push_back(ch.get(3).clone()); cv.merge(out, m); del(ch, out);
+  return m;
 }
 
 /* ---------- OCR ---------- */
@@ -325,13 +350,16 @@ $('run').addEventListener('click', async () => {
   const mats = [];
   try {
     const src = cv.imread(srcCanvas); mats.push(src);
-    const det = findPlate(src);
+    const est = estimateBlur(src), pre = est.blurred;
+    let work = src;
+    if (pre) { $('note').textContent = `Horizontal motion blur detected (about ${est.L}px). Deblurring the full image...`; await sleep(30); work = deblurImage(src, est.L); mats.push(work); }
+    const det = findPlate(work);
     const view = document.createElement('canvas'); showCanvas(view, srcCanvas);
     const x = view.getContext('2d'); x.strokeStyle = '#f2b01e'; x.lineWidth = Math.max(3, view.width / 250); x.beginPath();
     det.pts.forEach((p, i) => i ? x.lineTo(p.x, p.y) : x.moveTo(p.x, p.y)); x.closePath(); x.stroke();
     showCanvas($('cIn'), view);
 
-    const crop = cropStraight(src, det); mats.push(crop.gray, crop.color);
+    const crop = cropStraight(work, det); mats.push(crop.gray, crop.color);
     cv.imshow($('cPlate'), crop.color);
     $('note').textContent = (det.found ? `Plate found, straightened by ${crop.angle.toFixed(1)} degrees.` : 'No clear plate contour found, using a centre crop.') + ' Reconstructing...';
     await sleep(30);
@@ -347,12 +375,13 @@ $('run').addEventListener('click', async () => {
     $('note').textContent = 'Deblurring motion blur (Wiener)...';
     await sleep(30);
     const extra = [], wmats = {};
-    for (const fr of [0.012, 0.018, 0.026]) {
+    for (const fr of (pre ? [] : [0.012, 0.018, 0.026])) {
       const L = Math.max(3, Math.round(en.big.cols * fr)), wm = wiener(en.plain, L, 0.008); mats.push(wm);
       wmats['wiener' + L] = wm; extra.push({ n: 'wiener' + L, m: wm, psm: '7' });
       if (fr === 0.018) { const o = new cv.Mat(); cv.GaussianBlur(wm, o, new cv.Size(3, 3), 0); cv.threshold(o, o, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU); if (cv.mean(o)[0] < 127) cv.bitwise_not(o, o); mats.push(o); extra.push({ n: 'wiener' + L + '-otsu', m: o, psm: '7' }); }
     }
-    hd = wmats['wiener' + Math.max(3, Math.round(en.big.cols * 0.018))]; cv.imshow($('cHD'), hd);
+    if (!pre) hd = wmats['wiener' + Math.max(3, Math.round(en.big.cols * 0.018))];
+    cv.imshow($('cHD'), hd);
     $('note').textContent = 'Running OCR passes...';
     const variants = makeVariants(en.plain, en.sharp, extra); mats.push(variants[2].m, variants[3].m);
     const results = [];
