@@ -50,7 +50,7 @@ h1{font-size:1.5rem;margin:0;font-weight:700}
 <div class="bar">
   <span class="pick"><input type="file" id="file" accept="image/*"><label class="btn" for="file">Select Vehicle Image</label></span>
   <button id="run" class="btn main" disabled>Run Plate Detection, Pixel Deblur &amp; OCR</button>
-  <label class="opt"><input type="checkbox" id="useOnnx"> Try pixel_enhancer.onnx (experimental)</label>
+  <label class="opt"><input type="checkbox" id="useOnnx"> Try pixel_enhancer.onnx (experimental, keep off)</label>
 </div>
 
 <section class="result" aria-live="polite">
@@ -205,6 +205,10 @@ function cropStraight(src, det) {
   while (b > gh * 0.75 && rowF[b] > 0.75) b--;
   while (l < gw * 0.05 && colF[l] > 0.9) l++;
   while (r > gw * 0.95 && colF[r] > 0.9) r--;
+  // trim blue IND strip on the left
+  const cb = new Float32Array(gw), rd = rgba.data;
+  for (let x = 0; x < gw; x++) { let s = 0; for (let y = 0; y < gh; y++) { const i = (y * gw + x) * 4; s += rd[i + 2] - Math.max(rd[i], rd[i + 1]); } cb[x] = s / gh; }
+  const l0 = l; while (l < gw * 0.2 && cb[l] > 25) l++; if (l > l0) l += 3;
   del(bin);
   const rr = new cv.Rect(l, t, Math.max(8, r - l + 1), Math.max(8, b - t + 1));
   const outG = gray.roi(rr).clone(), outC = rgba.roi(rr).clone(); del(gray, rgba);
@@ -246,6 +250,28 @@ async function onnxEnhance(g) {
   return null;
 }
 
+/* Wiener deconvolution for horizontal motion blur (PSF = box of length L) */
+function wiener(g8, L, K) {
+  const w = g8.cols, h = g8.rows, p = L * 2 + 8;
+  const f = new cv.Mat(); g8.convertTo(f, cv.CV_32F, 1 / 255);
+  const pd = new cv.Mat(); cv.copyMakeBorder(f, pd, 0, 0, p, p, cv.BORDER_REPLICATE);
+  const W = cv.getOptimalDFTSize(pd.cols), H = cv.getOptimalDFTSize(pd.rows), pd2 = new cv.Mat();
+  cv.copyMakeBorder(pd, pd2, 0, H - pd.rows, 0, W - pd.cols, cv.BORDER_REPLICATE);
+  const psf = cv.Mat.zeros(H, W, cv.CV_32F);
+  for (let x = -(L >> 1); x < L - (L >> 1); x++) psf.data32F[(x + W) % W] = 1 / L;
+  const cplx = m => { const z = cv.Mat.zeros(H, W, cv.CV_32F), v = new cv.MatVector(), c = new cv.Mat(); v.push_back(m); v.push_back(z); cv.merge(v, c); cv.dft(c, c); del(z, v); return c; };
+  const G = cplx(pd2), P = cplx(psf), g = G.data32F, q = P.data32F;
+  for (let i = 0; i < g.length; i += 2) {
+    const a = g[i], b = g[i + 1], c = q[i], d = q[i + 1], den = c * c + d * d + K;
+    g[i] = (a * c + b * d) / den; g[i + 1] = (b * c - a * d) / den;
+  }
+  const out = new cv.Mat(); cv.dft(G, out, cv.DFT_INVERSE | cv.DFT_SCALE | cv.DFT_REAL_OUTPUT);
+  const roi = out.roi(new cv.Rect(p, 0, w, h)), n = new cv.Mat(); roi.convertTo(n, cv.CV_8U, 255);
+  cv.normalize(n, n, 0, 255, cv.NORM_MINMAX);
+  const res = n.clone(); del(f, pd, pd2, psf, G, P, out, roi, n);
+  return res;
+}
+
 /* ---------- OCR ---------- */
 function padded(m) {
   const o = new cv.Mat(); cv.copyMakeBorder(m, o, 30, 30, 40, 40, cv.BORDER_CONSTANT, new cv.Scalar(255, 255, 255, 255)); return o;
@@ -253,7 +279,7 @@ function padded(m) {
 function toURL(m) {
   const c = document.createElement('canvas'); cv.imshow(c, m); return c.toDataURL('image/png');
 }
-function makeVariants(plain, sharp) {
+function makeVariants(plain, sharp, extra) {
   const v = [], bl = new cv.Mat(), otsu = new cv.Mat(), ad = new cv.Mat();
   cv.GaussianBlur(sharp, bl, new cv.Size(3, 3), 0);
   cv.threshold(bl, otsu, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU);
@@ -261,6 +287,7 @@ function makeVariants(plain, sharp) {
   cv.adaptiveThreshold(bl, ad, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, bs, 12);
   [otsu, ad].forEach(m => { if (cv.mean(m)[0] < 127) cv.bitwise_not(m, m); });
   v.push({ n: 'gray', m: plain, psm: '7' }, { n: 'sharp', m: sharp, psm: '7' }, { n: 'otsu', m: otsu, psm: '7' }, { n: 'adaptive', m: ad, psm: '7' }, { n: 'sharp-multiline', m: sharp, psm: '6' });
+  (extra || []).forEach(x => v.push(x));
   del(bl);
   return v;
 }
@@ -317,8 +344,17 @@ $('run').addEventListener('click', async () => {
     }
     cv.imshow($('cHD'), hd);
 
+    $('note').textContent = 'Deblurring motion blur (Wiener)...';
+    await sleep(30);
+    const extra = [], wmats = {};
+    for (const fr of [0.012, 0.018, 0.026]) {
+      const L = Math.max(3, Math.round(en.big.cols * fr)), wm = wiener(en.plain, L, 0.008); mats.push(wm);
+      wmats['wiener' + L] = wm; extra.push({ n: 'wiener' + L, m: wm, psm: '7' });
+      if (fr === 0.018) { const o = new cv.Mat(); cv.GaussianBlur(wm, o, new cv.Size(3, 3), 0); cv.threshold(o, o, 0, 255, cv.THRESH_BINARY | cv.THRESH_OTSU); if (cv.mean(o)[0] < 127) cv.bitwise_not(o, o); mats.push(o); extra.push({ n: 'wiener' + L + '-otsu', m: o, psm: '7' }); }
+    }
+    hd = wmats['wiener' + Math.max(3, Math.round(en.big.cols * 0.018))]; cv.imshow($('cHD'), hd);
     $('note').textContent = 'Running OCR passes...';
-    const variants = makeVariants(en.plain, en.sharp); mats.push(variants[2].m, variants[3].m);
+    const variants = makeVariants(en.plain, en.sharp, extra); mats.push(variants[2].m, variants[3].m);
     const results = [];
     for (const v of variants) {
       const pm = padded(v.m);
@@ -335,6 +371,7 @@ $('run').addEventListener('click', async () => {
     cands.sort((a, b) => b.score - a.score);
     if (cands.length) {
       const c = cands[0], fmt = formatPlate(c.plate);
+      if (wmats[c.r.n]) cv.imshow($('cHD'), wmats[c.r.n]); else if (wmats[c.r.n.replace('-otsu', '')]) cv.imshow($('cHD'), wmats[c.r.n.replace('-otsu', '')]);
       $('plateTxt').textContent = fmt; $('fmt').textContent = fmt;
       $('raw').textContent = c.r.text.trim().replace(/\s+/g, ' ') || '-'; $('conf').textContent = c.r.conf.toFixed(1) + '%';
       $('note').textContent = `Best match from "${c.r.n}" pass, agreed by ${votes[c.plate]} of ${results.length} passes.` + (STATES.has(c.state) ? '' : ' The state code is not a known RTO code, so check the result.');
