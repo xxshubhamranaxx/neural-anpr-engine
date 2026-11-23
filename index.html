@@ -4,11 +4,11 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Neural ANPR & Blur Plate Reconstruction Engine</title>
-  <!-- ONNX Runtime Web (Runs your custom trained .onnx models in browser) -->
+  <!-- ONNX Runtime Web -->
   <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js"></script>
-  <!-- OpenCV.js (4-Point Perspective Warp & Cropping) -->
+  <!-- OpenCV.js -->
   <script async src="https://docs.opencv.org/4.8.0/opencv.js" onload="onOpenCvReady()"></script>
-  <!-- Tesseract.js (OCR Engine) -->
+  <!-- Tesseract.js -->
   <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
   <style>
     :root {
@@ -25,7 +25,7 @@
     .container { max-width: 1120px; width: 100%; }
     header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 24px; flex-wrap: wrap; gap: 10px; }
     h1 { color: var(--accent); font-size: 1.45rem; }
-    .status-pill { background: #064e3b; color: #34d399; padding: 6px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
+    .status-pill { background: #064e3b; color: #34d399; padding: 6px 12px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; max-width: 480px; }
     .upload-zone { background: var(--card); border: 2px dashed var(--accent); border-radius: 10px; padding: 24px; text-align: center; margin-bottom: 20px; }
     input[type="file"] { color: var(--text); font-size: 0.95rem; cursor: pointer; }
     button { margin-top: 14px; padding: 12px 28px; background: var(--accent); color: #040812; font-weight: 700; border: none; border-radius: 6px; cursor: pointer; font-size: 1rem; }
@@ -79,6 +79,10 @@
   </div>
 
   <script>
+    // Fix ONNX Runtime WASM binary CDN path
+    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/";
+    ort.env.wasm.numThreads = 1;
+
     let detectorSession = null;
     let enhancerSession = null;
     let cvLoaded = false;
@@ -92,12 +96,19 @@
 
     async function initModels() {
       try {
-        statusEl.textContent = "Loading Custom ONNX Neural Networks...";
-        detectorSession = await ort.InferenceSession.create('./plate_detector.onnx');
-        enhancerSession = await ort.InferenceSession.create('./pixel_enhancer.onnx');
+        statusEl.textContent = "Loading plate_detector.onnx...";
+        detectorSession = await ort.InferenceSession.create('./plate_detector.onnx', {
+          executionProviders: ['wasm']
+        });
+
+        statusEl.textContent = "Loading pixel_enhancer.onnx...";
+        enhancerSession = await ort.InferenceSession.create('./pixel_enhancer.onnx', {
+          executionProviders: ['wasm']
+        });
+
         checkReady();
       } catch (err) {
-        statusEl.textContent = "Model Load Error (Serve via HTTP/HTTPS, not file://)";
+        statusEl.textContent = "Error: " + (err.message || err);
         statusEl.style.background = "#7f1d1d";
         statusEl.style.color = "#fca5a5";
         console.error(err);
@@ -112,7 +123,11 @@
     function checkReady() {
       if (detectorSession && enhancerSession && cvLoaded) {
         statusEl.textContent = "All Neural Engines Online (Ready)";
+        statusEl.style.background = "#064e3b";
+        statusEl.style.color = "#34d399";
         uploadEl.disabled = false;
+      } else if (detectorSession && enhancerSession && !cvLoaded) {
+        statusEl.textContent = "Models Loaded, Waiting for OpenCV...";
       }
     }
 
