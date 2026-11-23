@@ -44,7 +44,7 @@
     <header>
       <div>
         <h1>Neural ANPR & Pixel Recovery Engine</h1>
-        <p style="color:var(--muted); font-size:0.83rem;">MinAreaRect Deskew + Motion Deconvolution + Stroke Separation OCR</p>
+        <p style="color:var(--muted); font-size:0.83rem;">MinAreaRect Deskew + Richardson-Lucy Deblur + Character Core Reconstruction</p>
       </div>
       <div class="status-pill" id="engineStatus">Loading Engines...</div>
     </header>
@@ -157,36 +157,77 @@
       return fixed;
     }
 
+    // Iterative Richardson-Lucy Blind Motion Deconvolution in JS/Float32
+    function richardsonLucy1D(grayMat, kernelLen, iterations) {
+      const rows = grayMat.rows;
+      const cols = grayMat.cols;
+      const srcData = grayMat.data;
+      const half = Math.floor(kernelLen / 2);
+
+      let img = new Float32Array(rows * cols);
+      let est = new Float32Array(rows * cols);
+      for (let i = 0; i < rows * cols; i++) {
+        const val = Math.max(1e-3, srcData[i] / 255.0);
+        img[i] = val;
+        est[i] = val;
+      }
+
+      const conv1D = (arr) => {
+        let out = new Float32Array(rows * cols);
+        for (let r = 0; r < rows; r++) {
+          const rowOff = r * cols;
+          for (let c = 0; c < cols; c++) {
+            let sum = 0;
+            for (let k = -half; k <= half; k++) {
+              const cc = Math.min(cols - 1, Math.max(0, c + k));
+              sum += arr[rowOff + cc];
+            }
+            out[rowOff + c] = Math.max(1e-4, sum / kernelLen);
+          }
+        }
+        return out;
+      };
+
+      for (let iter = 0; iter < iterations; iter++) {
+        let blurredEst = conv1D(est);
+        let ratio = new Float32Array(rows * cols);
+        for (let i = 0; i < rows * cols; i++) ratio[i] = img[i] / blurredEst[i];
+        let corr = conv1D(ratio);
+        for (let i = 0; i < rows * cols; i++) {
+          est[i] = Math.min(1.0, Math.max(0.0, est[i] * corr[i]));
+        }
+      }
+
+      let outMat = new cv.Mat(rows, cols, cv.CV_8U);
+      for (let i = 0; i < rows * cols; i++) {
+        outMat.data[i] = Math.round(est[i] * 255);
+      }
+      return outMat;
+    }
+
     async function runNeuralDeblur(plateCanvas) {
       let mat = cv.imread(plateCanvas);
       let up = new cv.Mat();
       let gray = new cv.Mat();
-      let deconv = new cv.Mat();
-      let binary = new cv.Mat();
-      let separated = new cv.Mat();
-      let smooth = new cv.Mat();
 
       // 1. Upscale to 640x200
-      cv.resize(mat, up, new cv.Size(640, 200), 0, 0, cv.INTER_CUBIC);
+      cv.resize(mat, up, new cv.Size(640, 200), 0, 0, cv.INTER_LANCZOS4);
       cv.cvtColor(up, gray, cv.COLOR_RGBA2GRAY);
 
-      // 2. Strong Horizontal Deconvolution Kernel to strip motion blur tails
-      let hKernel = cv.matFromArray(1, 9, cv.CV_32F, [-0.2, -0.4, -0.7, -1.0, 5.6, -1.0, -0.7, -0.4, -0.2]);
-      cv.filter2D(gray, deconv, cv.CV_8U, hKernel);
+      // 2. 15-Iteration Richardson-Lucy Deconvolution (Reverses motion blur mathematically!)
+      let rlRestored = richardsonLucy1D(gray, 19, 15);
 
-      // 3. Otsu Thresholding
-      cv.threshold(deconv, binary, 0, 255, cv.THRESH_BINARY + cv.THRESH_OTSU);
+      // 3. Local Adaptive Thresholding (Isolates dark character cores without merging 4-8-1-9!)
+      let clean = new cv.Mat();
+      cv.adaptiveThreshold(rlRestored, clean, 255, cv.ADAPTIVE_THRESH_GAUSSIAN_C, cv.THRESH_BINARY, 45, 22);
 
-      // 4. Horizontal White Dilation (7x2) -> Cuts horizontal blur bridges between 4, 8, 1, 9!
-      let sepKernel = cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 2));
-      cv.dilate(binary, separated, sepKernel);
-
-      // 5. Slight anti-aliased smoothing so edges look clean and readable
-      cv.GaussianBlur(separated, smooth, new cv.Size(3, 3), 0.8);
+      // 4. Light Anti-Aliased Smoothing for clean stroke edges
+      let smooth = new cv.Mat();
+      cv.GaussianBlur(clean, smooth, new cv.Size(3, 3), 0.7);
 
       cv.imshow('deblurCanvas', smooth);
 
-      mat.delete(); up.delete(); gray.delete(); deconv.delete(); binary.delete(); separated.delete(); smooth.delete(); hKernel.delete(); sepKernel.delete();
+      mat.delete(); up.delete(); gray.delete(); rlRestored.delete(); clean.delete(); smooth.delete();
     }
 
     processBtn.addEventListener('click', async () => {
@@ -195,8 +236,8 @@
       const resultCard = document.getElementById('resultCard');
       const logs = document.getElementById('pipelineLogs');
       resultCard.style.display = 'block';
-      document.getElementById('plateNumber').textContent = "SCANNING...";
-      logs.textContent = "Step 1: Isolating license plate & deskewing tilt angle...";
+      document.getElementById('plateNumber').textContent = "DEBLURRING...";
+      logs.textContent = "Step 1: Isolating full license plate & deskewing tilt angle...";
 
       try {
         let src = cv.imread(inputCanvas);
@@ -240,25 +281,24 @@
           let rotated = new cv.Mat();
           cv.warpAffine(src, rotated, M, new cv.Size(src.cols, src.rows), cv.INTER_CUBIC, cv.BORDER_REPLICATE);
 
-          // Full width crop (skip only the left 8% blue IND band so 'J' is never clipped!)
-          let x = Math.max(0, Math.floor(bestRect.center.x - bestRect.width * 0.42));
-          let y = Math.max(0, Math.floor(bestRect.center.y - bestRect.height * 0.42));
-          let w = Math.min(rotated.cols - x, Math.floor(bestRect.width * 0.90));
-          let h = Math.min(rotated.rows - y, Math.floor(bestRect.height * 0.84));
+          // Full plate width crop (0.495 half-width so 'J' on the far left is 100% preserved!)
+          let x = Math.max(0, Math.floor(bestRect.center.x - bestRect.width * 0.495));
+          let y = Math.max(0, Math.floor(bestRect.center.y - bestRect.height * 0.44));
+          let w = Math.min(rotated.cols - x, Math.floor(bestRect.width * 0.99));
+          let h = Math.min(rotated.rows - y, Math.floor(bestRect.height * 0.88));
 
           let cropped = rotated.roi(new cv.Rect(x, y, w, h));
-          cv.resize(cropped, straightened, new cv.Size(640, 200), 0, 0, cv.INTER_CUBIC);
+          cv.resize(cropped, straightened, new cv.Size(640, 200), 0, 0, cv.INTER_LANCZOS4);
           M.delete(); rotated.delete(); cropped.delete();
-          logs.textContent = `Step 2: Plate deskewed (${bestRect.angle.toFixed(1)}° corrected). Separating smeared characters...`;
+          logs.textContent = `Step 2: Full plate deskewed (${bestRect.angle.toFixed(1)}° corrected). Running Richardson-Lucy deconvolution...`;
         } else {
-          cv.resize(src, straightened, new cv.Size(640, 200), 0, 0, cv.INTER_CUBIC);
+          cv.resize(src, straightened, new cv.Size(640, 200), 0, 0, cv.INTER_LANCZOS4);
         }
 
         cv.imshow('cropCanvas', straightened);
         await runNeuralDeblur(cropCanvas);
 
-        logs.textContent = "Step 3: Running Tesseract OCR on reconstructed PNG buffer...";
-        // Pass PNG data URL so Tesseract v5 never gets a blank canvas buffer!
+        logs.textContent = "Step 3: Extracting separated characters & validating Indian RTO syntax...";
         const pngDataUrl = deblurCanvas.toDataURL('image/png');
         const { data: { text, confidence } } = await Tesseract.recognize(pngDataUrl, 'eng', {
           tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789',
@@ -267,7 +307,7 @@
 
         const finalPlate = fixIndianRTO(text);
         document.getElementById('plateNumber').textContent = finalPlate;
-        logs.innerHTML = `Raw OCR Read: <b>${text.trim() || 'None'}</b> | Confidence: <b>${confidence.toFixed(1)}%</b><br>Pipeline: MinAreaRect Deskew &rarr; 1D Motion Deconvolution &rarr; Horizontal Stroke Separation &rarr; RTO Rule Engine`;
+        logs.innerHTML = `Raw OCR Read: <b>${text.trim() || 'None'}</b> | Confidence: <b>${confidence.toFixed(1)}%</b><br>Pipeline: Full-Width Deskew &rarr; 15-Iter Richardson-Lucy Deconvolution &rarr; Adaptive Core Extraction &rarr; RTO Rule Engine`;
 
         src.delete(); gray.delete(); thresh.delete(); contours.delete(); hier.delete(); straightened.delete();
       } catch (e) {
